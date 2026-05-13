@@ -1,9 +1,10 @@
-"""V2 论文采集器 — 搜作者 -> 全量采集 -> Excel
+"""V2 论文采集器 v2.1 - 支持翻页
 
-用法: python collector.py 赵一冉 --max 5
-采集: HTML阅读(标题/摘要/关键词/基金/作者简介) + 知网详情页(标题/作者机构/摘要/关键词/基金/专辑/专题/分类号) + XHR元数据
-上限: 200篇
-依赖: 旧规范文档CDP客户端
+用法: python collector.py 张伟 --max 50
+
+新功能:
+- briefRequest翻页机制: 从XHR响应HTML中提取翻页参数,循环请求多页
+- 默认上限200篇, --max控制HTML打开数
 """
 import sys, os, json, time, re, urllib.request
 import pandas as pd
@@ -13,7 +14,6 @@ from author_agent.cdp_client import new_tab, close_tab, eval_js, click_at, page_
 
 PROXY = "http://localhost:3456"
 OUTPUT_DIR = r"E:\名称规范系统\新规范文档系统\collected"
-MAX_PAPERS = 200
 
 def get(path):
     with urllib.request.urlopen(PROXY + path) as r:
@@ -44,36 +44,83 @@ def find_or_create_cnki_tab():
     print("   -> 请在Chrome知网页面手动搜索一次激活,然后重新运行")
     sys.exit(0)
 
-def search_author(tab_id, author_name):
-    js = 'var cs=window.cnkiSearch;var base=JSON.parse(cs.getSearchJsonInfo());base.QNode.QGroup=[{Key:"S",Title:"",Logic:0,Items:[],ChildItems:[]}];base.QNode.QGroup[0].ChildItems=[{Key:"a",Title:"",Logic:0,Items:[{Key:"a",Title:"",Logic:0,Field:"AU",Operator:"DEFAULT",Value:"'+author_name+'",Value2:""}],ChildItems:[]}];var qj=JSON.stringify(base);var x=new XMLHttpRequest();x.open("POST","/kns8s/brief/grid",false);x.setRequestHeader("Content-Type","application/x-www-form-urlencoded;charset=UTF-8");x.send("boolSearch=true&QueryJson="+encodeURIComponent(qj));window.__h=x.responseText;var m=x.responseText.match(/共找到<\\/span>\\s*<em>(\\d+)<\\/em>/);var totalCount=m?parseInt(m[1]):0;var titles=[];var tr=/<a[^>]*class="fz14"[^>]*>([^<]+)<\\/a>/g;var tm;while(tm=tr.exec(x.responseText)){var tt=tm[1].trim();if(tt.length>3&&tt!="题名"&&tt!="作者"&&tt!="来源")titles.push(tt)};JSON.stringify({count:totalCount,titles:titles,len:x.responseText.length})'
-    r = eval_js(tab_id, js)
-    try: return json.loads(str(r))
-    except: return {"count":0, "titles":[], "len":0}
+def search_author(tab_id, author_name, max_results=50):
+    """同步XHR搜索+自动翻页。Python从window.__h提取briefRequest实现翻页"""
+    all_titles = []
+    total_count = 0
+    brief_request = ""
+
+    base_setup = 'var cs=window.cnkiSearch;var base=JSON.parse(cs.getSearchJsonInfo());' + \
+        'base.QNode.QGroup=[{Key:"S",Title:"",Logic:0,Items:[],ChildItems:[]}];' + \
+        'base.QNode.QGroup[0].ChildItems=[{Key:"a",Title:"",Logic:0,Items:[{Key:"a",Title:"",Logic:0,Field:"AU",Operator:"DEFAULT",Value:"' + author_name + '",Value2:""}],ChildItems:[]}];' + \
+        'var qj=JSON.stringify(base);var x=new XMLHttpRequest();x.open("POST","/kns8s/brief/grid",false);' + \
+        'x.setRequestHeader("Content-Type","application/x-www-form-urlencoded;charset=UTF-8");'
+
+    for page in range(1, 20):
+        if page == 1:
+            js = base_setup + 'x.send("boolSearch=true&QueryJson="+encodeURIComponent(qj));window.__h=x.responseText;"ok"'
+        else:
+            if not brief_request: break
+            js = 'var br=' + json.dumps(brief_request) + ';' + \
+                'var qj=typeof br==="string"?br:JSON.stringify(br);' + \
+                'var x=new XMLHttpRequest();x.open("POST","/kns8s/brief/grid",false);' + \
+                'x.setRequestHeader("Content-Type","application/x-www-form-urlencoded;charset=UTF-8");' + \
+                'x.send("boolSearch=false&QueryJson="+encodeURIComponent(qj));window.__h=x.responseText;"ok"'
+
+        eval_js(tab_id, js)
+        html = str(eval_js(tab_id, 'window.__h'))
+        if len(html) < 100: break
+
+        titles = re.findall(r'<a[^>]*class="fz14"[^>]*>([^<]+)</a>', html)
+        titles = [t.strip() for t in titles if len(t.strip())>3 and t.strip() not in ('题名','作者','来源','发表时间','数据库','被引','下载','操作')]
+
+        if page == 1:
+            m = re.search(r'共找到</span>\s*<em>([\d,]+)</em>', html)
+            total_count = int(m.group(1).replace(',','')) if m else 0
+
+        br_match = re.search(r'id="briefRequest"[^>]+value="([^"]+)"', html)
+        if br_match:
+            brief_request = br_match.group(1).replace('&quot;','"').replace('&lt;','<').replace('&gt;','>').replace('&amp;','&')
+
+        all_titles.extend(titles)
+        if page == 1:
+            eval_js(tab_id, 'window.__h_page1=window.__h')
+        print(f"  第{page}页: {len(titles)}篇, 累计{len(all_titles)}篇")
+        if len(all_titles) >= max_results: break
+        if not brief_request: break
+
+    eval_js(tab_id, 'if(window.__h_page1)window.__h=window.__h_page1')
+    return {"count": total_count, "titles": all_titles[:max_results], "len": len(all_titles)}
 
 def collect_all_papers(tab_id, author_name, titles, max_open=20):
+    """全量采集"""
     meta_js = 'var html=window.__h;var papers=[];var rows=html.split("<tr");rows.forEach(function(r){var t=r.replace(/<[^>]+>/g," ").replace(/\\s+/g," ").trim();if(t.length>20&&t.indexOf("题名")===-1&&t.indexOf("操作")===-1)papers.push(t.substring(0,300))});JSON.stringify(papers)'
     r = eval_js(tab_id, meta_js)
     try: metadata = json.loads(str(r))
     except: metadata = []
-    actual_total = len(metadata)
-    if actual_total == 0: actual_total = len(titles)
+
+    MAX_PAPERS = 200
+    actual_total = max(len(titles), len(metadata))
     total = min(actual_total, MAX_PAPERS)
     if actual_total > MAX_PAPERS: print(f"  搜索结果 {actual_total} 条, 取前{MAX_PAPERS}篇")
     else: print(f"  搜索结果 {total} 条, 全部采集")
+
     eval_js(tab_id, 'var bb=document.getElementById("briefBox");if(bb){bb.innerHTML=window.__h};"ok"')
     time.sleep(0.5)
     r = eval_js(tab_id, 'var c=0;document.querySelectorAll("a").forEach(function(a){if(a.textContent.indexOf("HTML阅读")>-1)c++});String(c)')
     html_count = int(r) if r and str(r).isdigit() else 0
     print(f"  其中 {html_count} 篇有HTML阅读")
+
     papers = []; html_opened = 0
     for i in range(total):
         idx = i + 1
         try:
-            paper = {"序号":idx,"论文元数据":metadata[i] if i<len(metadata) else "","论文标题":titles[i] if i<len(titles) else metadata[i][:50] if i<len(metadata) else "","作者简介原文":"","页面头部信息":"","来源":"仅元数据"}
+            paper = {"序号":idx,"论文元数据":metadata[i] if i<len(metadata) else "","论文标题":titles[i] if i<len(titles) else "","作者简介原文":"","页面头部信息":"","来源":"仅元数据"}
             if i > 0: eval_js(tab_id, 'var bb=document.getElementById("briefBox");if(bb){bb.innerHTML=window.__h};"ok"'); time.sleep(0.3)
             has_html_link = i < html_count
             can_open_html = has_html_link and html_opened < max_open
             is_html = False
+
             if can_open_html:
                 eval_js(tab_id, f'var c=0;document.querySelectorAll("a").forEach(function(a){{if(a.textContent.indexOf("HTML阅读")>-1){{c++;if(c=={i+1})a.id="__ht{i+1}"}}}});"m"')
                 time.sleep(0.2)
@@ -104,6 +151,7 @@ def collect_all_papers(tab_id, author_name, titles, max_open=20):
                             paper["来源"] = "HTML阅读"
                             is_html = True; html_opened += 1
                         close_tab(html_tab)
+
             if not has_html_link and not paper.get("页面头部信息"):
                 raw_html = str(eval_js(tab_id, 'window.__h'))
                 detail_urls = re.findall(r'/kcms2/article/abstract\\?v=[^\"&\\']+', raw_html)
@@ -139,16 +187,15 @@ def collect_all_papers(tab_id, author_name, titles, max_open=20):
                             paper["来源"] = "知网详情页"
                         close_tab(d_tab)
                 if not paper.get("来源"):
-                    meta = metadata[i] if i < len(metadata) else ""
-                    paper["页面头部信息"] = meta[:500]; paper["来源"] = "XHR元数据"
+                    paper["页面头部信息"] = ""; paper["来源"] = "XHR元数据"
+
             tag = "HTML" if is_html else ("详情" if paper.get("来源")=="知网详情页" else "META")
             print(f"    [{idx}/{total}] {tag} {paper['论文标题'][:50]}")
             papers.append(paper); time.sleep(0.3)
         except Exception as e:
             import traceback
             print(f"    [{idx}] ERROR: {e}")
-            paper = {"序号":idx,"论文标题":titles[i] if i<len(titles) else "","页面头部信息":f"失败:{str(e)}","来源":f"失败:{str(e)[:50]}"}
-            papers.append(paper)
+            papers.append({"序号":idx,"论文标题":titles[i] if i<len(titles) else "","来源":f"失败:{str(e)[:50]}"})
     return papers
 
 def save_to_excel(papers, author_name):
@@ -165,8 +212,8 @@ def collect(author_name, max_papers=20):
     print("1. 连接知网...")
     tab = find_or_create_cnki_tab()
     print(f"2. 搜索 {author_name}...")
-    result = search_author(tab, author_name)
-    print(f"   结果: {result.get('count',0)} 条 (当前第1页)")
+    result = search_author(tab, author_name, 50)
+    print(f"   结果: {result.get('count',0)} 条")
     if int(result.get("count",0)) == 0: print("   未找到结果!"); return None
     print("3. 全量采集论文...")
     papers = collect_all_papers(tab, author_name, result.get("titles",[]), max_papers)
