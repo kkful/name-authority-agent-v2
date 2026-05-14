@@ -53,9 +53,11 @@ def search_author(tab_id, author_name, max_results=200):
     """同步XHR搜索作者, 正确翻页（完整QueryJson + turnpage令牌）
 
     关键: QueryJson必须包含Resource/Products/KuaKuCode等完整字段;
-          翻页需要turnpage令牌 + 18个完整POST参数
+          翻页需要turnpage令牌 + 18个完整POST参数;
+          每页的详情链接按论文顺序累积，供采集阶段使用
     """
     all_titles = []
+    all_detail_urls = []  # 每页的详情链接，按论文顺序累积
     total_count = 0
     brief_request = {}
     turnpage_token = ""
@@ -149,17 +151,22 @@ window.__h=x.responseText;
             turnpage_token = tp_match.group(1)
 
         all_titles.extend(titles)
-        print(f"  第{page}页: {len(titles)}篇, 累计{len(all_titles)}篇")
+        # 提取本页的详情链接（按论文顺序）
+        page_urls = re.findall(r'/kcms2/article/abstract\?v=[^"&\']+', html)
+        if not page_urls:
+            page_urls = re.findall(r'/kcms2/article/abstract\?v=[^"\']+', html)
+        all_detail_urls.extend(page_urls)
+        print(f"  第{page}页: {len(titles)}篇, {len(page_urls)}个详情链接, 累计{len(all_titles)}篇")
         if len(all_titles) >= max_results: break
         if len(titles) == 0: break
         if not brief_request: break
 
     # 恢复第1页HTML用于DOM注入
     eval_js(tab_id, 'if(window.__h_page1)window.__h=window.__h_page1')
-    return {"count": total_count, "titles": all_titles[:max_results], "len": len(all_titles)}
+    return {"count": total_count, "titles": all_titles[:max_results], "len": len(all_titles), "detail_urls": all_detail_urls[:max_results]}
 
-def collect_all_papers(tab_id, author_name, titles, max_open=20):
-    """全量采集: 有HTML则打开全文, 无HTML则保存元数据。每轮重新注入DOM"""
+def collect_all_papers(tab_id, author_name, titles, detail_urls=None, max_open=20):
+    """全量采集: 有HTML则打开全文, 无HTML则从预提取的详情链接获取。每轮重新注入DOM"""
     # 从API返回HTML中解析全部论文元数据(不截断)
     meta_js = 'var html=window.__h;' + \
               'var papers=[];' + \
@@ -261,12 +268,8 @@ def collect_all_papers(tab_id, author_name, titles, max_open=20):
                             html_opened += 1
                         close_tab(html_tab)
 
-            # 非HTML论文：从detail URL提取
-            if not has_html_link and not paper.get("页面头部信息"):
-                raw_html = str(eval_js(tab_id, 'window.__h'))
-                detail_urls = re.findall(r'/kcms2/article/abstract\?v=[^"&\']+', raw_html)
-                if not detail_urls:
-                    detail_urls = re.findall(r'/kcms2/article/abstract\?v=[^"\']+', raw_html)
+            # 非HTML论文：从预提取的detail URL获取（所有页面的链接已汇总）
+            if not is_html and not paper.get("页面头部信息"):
                 if detail_urls and i < len(detail_urls):
                     detail_url = "https://kns.cnki.net" + detail_urls[i].replace("&amp;","&")
                     r = get("/new?url=" + urllib.request.quote(detail_url, safe=':/?=&'))
@@ -363,7 +366,7 @@ def collect(author_name, max_papers=20):
 
     # 3. 采集论文(HTML+元数据)
     print(f"3. 全量采集论文...")
-    papers = collect_all_papers(tab, author_name, result.get("titles",[]), max_papers)
+    papers = collect_all_papers(tab, author_name, result.get("titles",[]), result.get("detail_urls",[]), max_papers)
 
     # 4. 保存Excel
     print(f"4. 保存Excel...")
