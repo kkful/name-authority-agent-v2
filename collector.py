@@ -53,8 +53,7 @@ def search_author(tab_id, author_name, max_results=200):
     """同步XHR搜索作者, 正确翻页（完整QueryJson + turnpage令牌）
 
     关键: QueryJson必须包含Resource/Products/KuaKuCode等完整字段;
-          翻页需要turnpage令牌 + 18个完整POST参数;
-          pageSize=50 每页50条, 减少翻页次数
+          翻页需要turnpage令牌 + 18个完整POST参数
     """
     all_titles = []
     total_count = 0
@@ -63,7 +62,7 @@ def search_author(tab_id, author_name, max_results=200):
 
     for page in range(1, 20):
         if page == 1:
-            # 第1页: 构建完整QueryJson (pageSize=50)
+            # 第1页: 构建完整QueryJson
             js = f'''
 var cs=window.cnkiSearch;
 var base=JSON.parse(cs.getSearchJsonInfo());
@@ -74,7 +73,6 @@ base.Rlang="CHINESE";
 base.SearchType=3;
 base.Products="CJFQ,CAPJ,ZHYX,CJTL,CDFD,CMFD,CPFD,IPFD,CPVD,CCND,WBFD,SCSF,SCHF,SCSD,SNAD,CCJD,CJFN,CCVD";
 base.KuaKuCode="YSTT4HG0,LSTPFY1C,JUP3MUPD,MPMFIG1A,EMRPGLPA,WQ0UVIAA,BLZOG7CK,PWFIRAGL,NN3FJMUV,NLBO1Z6R";
-base.pageSize=50;
 base.QNode.QGroup=[{{Key:"S",Title:"",Logic:0,Items:[],ChildItems:[]}}];
 base.QNode.QGroup[0].ChildItems=[{{Key:"a",Title:"",Logic:0,Items:[{{Key:"a",Title:"",Logic:0,Field:"AU",Operator:"DEFAULT",Value:"{author_name}",Value2:""}}],ChildItems:[]}}];
 cs.setQueryJson(base);
@@ -91,14 +89,14 @@ window.__h=x.responseText;
                 break
             inner_qj = json.loads(brief_request['queryJson'])
             inner_qj['pageNum'] = page
-            inner_qj['pageSize'] = 50
+            inner_qj['pageSize'] = 20
             inner_qj_str = json.dumps(inner_qj)
             js = f'''
 var params={{
     boolSearch:"false",
     QueryJson:{json.dumps(inner_qj_str)},
     pageNum:"{page}",
-    pageSize:"50",
+    pageSize:"20",
     sortField:{json.dumps(brief_request.get("sortField","PT"))},
     sortType:"desc",
     dstyle:"listmode",
