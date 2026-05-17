@@ -54,10 +54,11 @@ def search_author(tab_id, author_name, max_results=200):
 
     关键: QueryJson必须包含Resource/Products/KuaKuCode等完整字段;
           翻页需要turnpage令牌 + 18个完整POST参数;
-          每页的详情链接按论文顺序累积，供采集阶段使用
+          每页的详情链接和HTML阅读链接按论文顺序累积，供采集阶段使用
     """
     all_titles = []
     all_detail_urls = []  # 每页的详情链接，按论文顺序累积
+    all_html_urls = []    # 每页的HTML阅读链接，按论文顺序累积
     total_count = 0
     brief_request = {}
     turnpage_token = ""
@@ -151,22 +152,27 @@ window.__h=x.responseText;
             turnpage_token = tp_match.group(1)
 
         all_titles.extend(titles)
-        # 提取本页的详情链接（按论文顺序）
+        # 提取本页的详情链接和HTML阅读链接（按论文顺序）
         page_urls = re.findall(r'/kcms2/article/abstract\?v=[^"&\']+', html)
         if not page_urls:
             page_urls = re.findall(r'/kcms2/article/abstract\?v=[^"\']+', html)
         all_detail_urls.extend(page_urls)
-        print(f"  第{page}页: {len(titles)}篇, {len(page_urls)}个详情链接, 累计{len(all_titles)}篇")
+        # 提取HTML阅读链接
+        html_links = re.findall(r'href="(/kcms2/article/abstract\?[^"]*)"[^>]*>HTML阅读<', html)
+        if not html_links:
+            html_links = re.findall(r'href="([^"]*)"[^>]*>HTML阅读<', html)
+        all_html_urls.extend(html_links)
+        print(f"  第{page}页: {len(titles)}篇, {len(page_urls)}详情, {len(html_links)}HTML, 累计{len(all_titles)}篇")
         if len(all_titles) >= max_results: break
         if len(titles) == 0: break
         if not brief_request: break
 
     # 恢复第1页HTML用于DOM注入
     eval_js(tab_id, 'if(window.__h_page1)window.__h=window.__h_page1')
-    return {"count": total_count, "titles": all_titles[:max_results], "len": len(all_titles), "detail_urls": all_detail_urls[:max_results]}
+    return {"count": total_count, "titles": all_titles[:max_results], "len": len(all_titles), "detail_urls": all_detail_urls[:max_results], "html_urls": all_html_urls[:max_results]}
 
-def collect_all_papers(tab_id, author_name, titles, detail_urls=None, max_open=20):
-    """全量采集: 有HTML则打开全文, 无HTML则从预提取的详情链接获取。每轮重新注入DOM"""
+def collect_all_papers(tab_id, author_name, titles, detail_urls=None, html_urls=None, max_open=20):
+    """全量采集: HTML阅读URL直接打开(绕过DOM), 无HTML则从预提取的详情链接获取"""
     # 从API返回HTML中解析全部论文元数据(不截断)
     meta_js = 'var html=window.__h;' + \
               'var papers=[];' + \
@@ -181,7 +187,6 @@ def collect_all_papers(tab_id, author_name, titles, detail_urls=None, max_open=2
     except: metadata = []
 
     MAX_PAPERS = 200
-    # 优先用翻页后的titles总数, metadata只是第一页
     actual_total = max(len(titles), len(metadata))
     total = min(actual_total, MAX_PAPERS)
     if actual_total > MAX_PAPERS:
@@ -189,15 +194,15 @@ def collect_all_papers(tab_id, author_name, titles, detail_urls=None, max_open=2
     else:
         print(f"  搜索结果 {total} 条, 全部采集")
 
-    # 注入DOM
+    # 注入DOM（仅用于提取元数据，HTML阅读不再依赖DOM点击）
     eval_js(tab_id, 'var bb=document.getElementById("briefBox");if(bb){bb.innerHTML=window.__h};"ok"')
     time.sleep(0.5)
-    r = eval_js(tab_id, 'var c=0;document.querySelectorAll("a").forEach(function(a){if(a.textContent.indexOf("HTML阅读")>-1)c++});String(c)')
-    html_count = int(r) if r and str(r).isdigit() else 0
+
+    html_count = len(html_urls) if html_urls else 0
     print(f"  其中 {html_count} 篇有HTML阅读")
 
     papers = []
-    html_opened = 0  # 已打开的HTML篇数
+    html_opened = 0
     for i in range(total):
         idx = i + 1
         try:
@@ -205,68 +210,48 @@ def collect_all_papers(tab_id, author_name, titles, detail_urls=None, max_open=2
                      "论文标题": titles[i] if i < len(titles) else metadata[i][:50] if i < len(metadata) else "",
                      "作者简介原文": "", "HTML全文": "", "全文长度": 0, "来源": "仅元数据(无HTML阅读)"}
 
-            # 每轮重新注入DOM（防止上轮点击后DOM被清）
-            if i > 0:
-                eval_js(tab_id, 'var bb=document.getElementById("briefBox");if(bb){bb.innerHTML=window.__h};"ok"')
-                time.sleep(0.3)
-
-            # 分支处理：有HTML开HTML, 无HTML开详情页
+            # 分支处理：有HTML预提取URL则直接打开, 无HTML开详情页
             is_html = False
-            has_html_link = i < html_count
+            has_html_link = html_urls and i < len(html_urls) and html_urls[i]
             can_open_html = has_html_link and html_opened < max_open
 
             if can_open_html:
-                eval_js(tab_id, f'var c=0;document.querySelectorAll("a").forEach(function(a){{if(a.textContent.indexOf("HTML阅读")>-1){{c++;if(c=={i+1})a.id="__ht{i+1}"}}}});"m"')
-                time.sleep(0.2)
-
-                click_body = f"#__ht{i+1}".encode("utf-8")
-                req = urllib.request.Request(f"{PROXY}/clickAt?target={tab_id}", data=click_body, method="POST")
-                req.add_header("Content-Type", "text/plain")
-                with urllib.request.urlopen(req, timeout=30) as rp:
-                    cr = json.loads(rp.read())
-                if cr.get("clicked"):
+                html_url = "https://kns.cnki.net" + html_urls[i].replace("&amp;","&")
+                r = get("/new?url=" + urllib.request.quote(html_url, safe=':/?=&'))
+                html_tab = r.get("targetId","")
+                if html_tab:
                     time.sleep(3)
-                    tabs = get("/targets")
-                    html_tab = ""
-                    for t in tabs:
-                        if "HTML" in t.get("title","") or "reader" in t.get("url",""):
-                            html_tab = t["targetId"]
-                    if html_tab:
-                        full_text = page_text(html_tab)
-                        if full_text and len(full_text) > 100:
-                            # 精准提取：标题+作者机构+摘要+关键词+基金+作者简介
-                            txt = full_text
-                            result = {}
-                            # 标题(第一行)
-                            result["标题"] = txt.split("\n")[0].strip()[:100]
-                            # 摘要:从"摘要"到"关键词"或"Abstract"（排除英文噪音）
-                            abs_m = re.search(r'(?:中文\s*)?摘要[：:]\s*([\s\S]+?)(?:关键词|Key\s*words|Abstract|基金|收稿|$)', txt)
-                            if not abs_m:
-                                abs_m = re.search(r'摘要[：:]\s*([\s\S]+?)(?:关键词|Key\s*words|Abstract|基金|收稿|$)', txt)
-                            if abs_m: result["摘要"] = abs_m.group(1).strip()[:800]
-                            # 关键词
-                            kw_m = re.search(r'(关键词[：:][^\n]+)', txt)
-                            if kw_m: result["关键词"] = kw_m.group(1).strip()[:200]
-                            # 基金
-                            fund_m = re.search(r'(基金[：:][^\n]+)', txt)
-                            if fund_m: result["基金"] = fund_m.group(1).strip()[:200]
-                            # 作者简介
-                            bio_m = re.search(r'作者简介[：:]\s*([\s\S]+?)(?:收稿日期|Received|$)', txt)
-                            if bio_m:
-                                result["作者简介"] = bio_m.group(1).strip()[:500]
-                                paper["作者简介原文"] = bio_m.group(1).strip()[:500]
-                            # 收稿日期
-                            date_m = re.search(r'(收稿日期[：:][^\n]+)', txt)
-                            if date_m: result["收稿日期"] = date_m.group(1).strip()[:50]
-                            # 拼接
-                            parts = []
-                            for k,v in result.items():
-                                if v: parts.append(f"{k}:{v}")
-                            paper["页面头部信息"] = "\n---\n".join(parts)
-                            paper["来源"] = "HTML阅读"
-                            is_html = True
-                            html_opened += 1
-                        close_tab(html_tab)
+                    full_text = page_text(html_tab)
+                    if full_text and len(full_text) > 100:
+                        # 精准提取：标题+作者机构+摘要+关键词+基金+作者简介
+                        txt = full_text
+                        result = {}
+                        result["标题"] = txt.split("\n")[0].strip()[:100]
+                        abs_m = re.search(r'(?:中文\s*)?摘要[：:]\s*([\s\S]+?)(?:关键词|Key\s*words|Abstract|基金|收稿|$)', txt)
+                        if not abs_m:
+                            abs_m = re.search(r'摘要[：:]\s*([\s\S]+?)(?:关键词|Key\s*words|Abstract|基金|收稿|$)', txt)
+                        if abs_m: result["摘要"] = abs_m.group(1).strip()[:800]
+                        kw_m = re.search(r'(关键词[：:][^\n]+)', txt)
+                        if kw_m: result["关键词"] = kw_m.group(1).strip()[:200]
+                        fund_m = re.search(r'(基金[：:][^\n]+)', txt)
+                        if fund_m: result["基金"] = fund_m.group(1).strip()[:200]
+                        bio_m = re.search(r'作者简介[：:]\s*([\s\S]+?)(?:收稿日期|Received|$)', txt)
+                        if bio_m:
+                            result["作者简介"] = bio_m.group(1).strip()[:500]
+                            paper["作者简介原文"] = bio_m.group(1).strip()[:500]
+                        date_m = re.search(r'(收稿日期[：:][^\n]+)', txt)
+                        if date_m: result["收稿日期"] = date_m.group(1).strip()[:50]
+                        parts = []
+                        for k,v in result.items():
+                            if v: parts.append(f"{k}:{v}")
+                        paper["页面头部信息"] = "\n---\n".join(parts)
+                        paper["来源"] = "HTML阅读"
+                        idx_bio = full_text.find("作者简介")
+                        if idx_bio > -1:
+                            paper["作者简介原文"] = full_text[idx_bio:idx_bio+500]
+                        is_html = True
+                        html_opened += 1
+                    close_tab(html_tab)
 
             # 非HTML论文：从预提取的detail URL获取（所有页面的链接已汇总）
             if not is_html and not paper.get("页面头部信息"):
@@ -279,7 +264,6 @@ def collect_all_papers(tab_id, author_name, titles, detail_urls=None, max_open=2
                         d_txt = page_text(d_tab)
                         if d_txt and len(d_txt) > 100:
                             result = {}
-                            # 跳过CNKI页头"总库"等,取真正的标题
                             lines = d_txt.split("\n")
                             title = ""
                             for line in lines:
@@ -287,22 +271,17 @@ def collect_all_papers(tab_id, author_name, titles, detail_urls=None, max_open=2
                                 if s and s not in ("总库","检索","CNKI AI","") and "http" not in s and len(s) > 5:
                                     title = s[:100]; break
                             result["标题"] = title
-                            # 作者+机构(标题后到摘要前)
                             abs_idx = d_txt.find("摘要")
                             if abs_idx > -1:
                                 author_block = d_txt[len(title):abs_idx].strip()[:500]
                                 if author_block:
                                     result["作者机构"] = author_block.replace("\n"," ")[:400]
-                            # 摘要
                             abs_m = re.search(r'摘要[：:]\s*([\s\S]+?)(?:关键词|Key\s*words|基金|专辑|专题|分类|$)', d_txt)
                             if abs_m: result["摘要"] = abs_m.group(1).strip()[:800]
-                            # 关键词(去重复前缀)
                             kw_m = re.search(r'关键词[：:]\s*([^\n]+)', d_txt)
                             if kw_m: result["关键词"] = "关键词:" + kw_m.group(1).strip()[:200]
-                            # 基金
                             fund_m = re.search(r'基金[资助]?[：:]\s*([^\n]+)', d_txt)
                             if fund_m: result["基金"] = "基金:" + fund_m.group(1).strip()[:200]
-                            # 专辑/专题/分类号
                             for field in ["专辑","专题","分类号","在线公开时间"]:
                                 fm = re.search(rf'{field}[：:]\s*([^\n]+)', d_txt)
                                 if fm: result[field] = f"{field}:{fm.group(1).strip()[:100]}"
@@ -366,7 +345,7 @@ def collect(author_name, max_papers=20):
 
     # 3. 采集论文(HTML+元数据)
     print(f"3. 全量采集论文...")
-    papers = collect_all_papers(tab, author_name, result.get("titles",[]), result.get("detail_urls",[]), max_papers)
+    papers = collect_all_papers(tab, author_name, result.get("titles",[]), result.get("detail_urls",[]), result.get("html_urls",[]), max_papers)
 
     # 4. 保存Excel
     print(f"4. 保存Excel...")
