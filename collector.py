@@ -134,7 +134,6 @@ window.__h=x.responseText;
         if page == 1:
             m = re.search(r'共找到</span>\s*<em>([\d,]+)</em>', html)
             total_count = int(m.group(1).replace(',','')) if m else 0
-            # 保存第1页HTML用于DOM注入
             eval_js(tab_id, 'window.__h_page1=window.__h')
 
         # 提取briefRequest和turnpage令牌
@@ -157,23 +156,19 @@ window.__h=x.responseText;
         if not page_urls:
             page_urls = re.findall(r'/kcms2/article/abstract\?v=[^"\']+', html)
         all_detail_urls.extend(page_urls)
-        # 提取HTML阅读链接
-        html_links = re.findall(r'href="(/kcms2/article/abstract\?[^"]*)"[^>]*>HTML阅读<', html)
-        if not html_links:
-            html_links = re.findall(r'href="([^"]*)"[^>]*>HTML阅读<', html)
+        # 提取HTML阅读链接（class="icon-html"的a标签）
+        html_links = re.findall(r'<a[^>]*class="[^"]*icon-html[^"]*"[^>]*href="([^"]+)"', html)
         all_html_urls.extend(html_links)
         print(f"  第{page}页: {len(titles)}篇, {len(page_urls)}详情, {len(html_links)}HTML, 累计{len(all_titles)}篇")
         if len(all_titles) >= max_results: break
         if len(titles) == 0: break
         if not brief_request: break
 
-    # 恢复第1页HTML用于DOM注入
     eval_js(tab_id, 'if(window.__h_page1)window.__h=window.__h_page1')
     return {"count": total_count, "titles": all_titles[:max_results], "len": len(all_titles), "detail_urls": all_detail_urls[:max_results], "html_urls": all_html_urls[:max_results]}
 
 def collect_all_papers(tab_id, author_name, titles, detail_urls=None, html_urls=None, max_open=20):
     """全量采集: HTML阅读URL直接打开(绕过DOM), 无HTML则从预提取的详情链接获取"""
-    # 从API返回HTML中解析全部论文元数据(不截断)
     meta_js = 'var html=window.__h;' + \
               'var papers=[];' + \
               'var rows=html.split("<tr");' + \
@@ -194,10 +189,6 @@ def collect_all_papers(tab_id, author_name, titles, detail_urls=None, html_urls=
     else:
         print(f"  搜索结果 {total} 条, 全部采集")
 
-    # 注入DOM（仅用于提取元数据，HTML阅读不再依赖DOM点击）
-    eval_js(tab_id, 'var bb=document.getElementById("briefBox");if(bb){bb.innerHTML=window.__h};"ok"')
-    time.sleep(0.5)
-
     html_count = len(html_urls) if html_urls else 0
     print(f"  其中 {html_count} 篇有HTML阅读")
 
@@ -210,20 +201,21 @@ def collect_all_papers(tab_id, author_name, titles, detail_urls=None, html_urls=
                      "论文标题": titles[i] if i < len(titles) else metadata[i][:50] if i < len(metadata) else "",
                      "作者简介原文": "", "HTML全文": "", "全文长度": 0, "来源": "仅元数据(无HTML阅读)"}
 
-            # 分支处理：有HTML预提取URL则直接打开, 无HTML开详情页
+            # 有HTML URL → 直接打开; 无HTML → 详情页
             is_html = False
             has_html_link = html_urls and i < len(html_urls) and html_urls[i]
             can_open_html = has_html_link and html_opened < max_open
 
             if can_open_html:
-                html_url = "https://kns.cnki.net" + html_urls[i].replace("&amp;","&")
+                html_url = html_urls[i].replace("&amp;","&")
+                if not html_url.startswith("http"):
+                    html_url = "https://kns.cnki.net" + html_url
                 r = get("/new?url=" + urllib.request.quote(html_url, safe=':/?=&'))
                 html_tab = r.get("targetId","")
                 if html_tab:
                     time.sleep(3)
                     full_text = page_text(html_tab)
                     if full_text and len(full_text) > 100:
-                        # 精准提取：标题+作者机构+摘要+关键词+基金+作者简介
                         txt = full_text
                         result = {}
                         result["标题"] = txt.split("\n")[0].strip()[:100]
@@ -253,7 +245,7 @@ def collect_all_papers(tab_id, author_name, titles, detail_urls=None, html_urls=
                         html_opened += 1
                     close_tab(html_tab)
 
-            # 非HTML论文：从预提取的detail URL获取（所有页面的链接已汇总）
+            # 非HTML论文：从预提取的detail URL获取
             if not is_html and not paper.get("页面头部信息"):
                 if detail_urls and i < len(detail_urls):
                     detail_url = "https://kns.cnki.net" + detail_urls[i].replace("&amp;","&")
@@ -302,9 +294,7 @@ def collect_all_papers(tab_id, author_name, titles, detail_urls=None, html_urls=
 
         except Exception as e:
             import traceback
-            err = traceback.format_exc()
             print(f"    [{idx}] ERROR: {e}")
-            print(f"    {err[-200:]}")
             paper = {"序号": idx, "论文标题": titles[i] if i < len(titles) else "",
                      "作者简介原文": "", "论文元数据": metadata[i] if i < len(metadata) else "",
                      "页面头部信息": f"采集失败: {str(e)}", "来源": f"失败:{str(e)[:50]}"}
@@ -329,12 +319,10 @@ def collect(author_name, max_papers=20):
     print(f"论文采集: {author_name}")
     print(f"{'='*50}")
 
-    # 1. 找知网tab
     print("1. 连接知网...")
     tab = find_or_create_cnki_tab()
     print(f"   Tab: {tab[:20]}")
 
-    # 2. 搜索
     print(f"2. 搜索 {author_name}...")
     result = search_author(tab, author_name)
     print(f"   结果: {result.get('count',0)} 条 (当前第1页)")
@@ -343,18 +331,16 @@ def collect(author_name, max_papers=20):
         print("   未找到结果!")
         return None
 
-    # 3. 采集论文(HTML+元数据)
     print(f"3. 全量采集论文...")
     papers = collect_all_papers(tab, author_name, result.get("titles",[]), result.get("detail_urls",[]), result.get("html_urls",[]), max_papers)
 
-    # 4. 保存Excel
     print(f"4. 保存Excel...")
     path = save_to_excel(papers, author_name)
     return path
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        name = "张伟"  # 默认测试
+        name = "张伟"
     else:
         name = sys.argv[1]
     max_p = 20
